@@ -53,16 +53,38 @@
 推荐策略：
 
 - 短视频可以整体作为一个片段。
-- 当视频超过设定阈值时，按固定时长截断，例如默认每 180 秒一段。
+- 当视频超过设定阈值时，按固定时长截断，例如默认每 600 秒一段。
 - 段数计算方式为 `ceil(video_duration / segment_seconds)`，最后一段允许短于固定时长。
 - 每个片段生成唯一 `segment_id`，并生成实际可用的视频段文件。
 - 视频段文件保存到 `outputs/02_segments/clips/<video_id>/<segment_id>.<ext>`。
 - 每个任务以视频段为单位生成；一个视频被截成 N 段，就生成 N 个独立的视频任务。
-- 每个关键帧生成唯一 `frame_id`。
-- 对截断后的视频段文件抽帧，抽帧时间间隔可通过配置自定义。
-- 保存关键帧图像路径、原视频绝对时间戳、所属片段、原始视频路径和截断后的视频段路径。
-- 根据截断后的视频长度写入 `clip_length_category`，例如 short、medium、long、extra_long。
-- 对截断后的视频段进行质量检查，过滤大量空白画面或画面变化不足的片段。
+- 根据截断后的视频长度写入 `clip_duration` 和 `clip_length_category`，分类包括 short、medium、long、extra_long。
+- 对截断后的视频段进行质量检查，过滤大量空白画面或画面变化不足的片段，并记录 `blank_frame_ratio`、`static_frame_ratio`、`average_scene_change` 等指标。
+- 每个关键帧生成唯一 `frame_id`，保存关键帧图像路径、原视频绝对时间戳、所属片段、原始视频路径和截断后的视频段路径。
+- 关键帧应尽量覆盖片段前、中、后段；当触发最大帧数上限时，关键帧需要在整个片段范围内均匀分布，不能只集中在开头。
+
+三阶段关键帧抽取规则：
+
+1. 第一阶段：按片段长度分类设置基础抽帧间隔和帧数上下限。
+   - short：`<= 60s`，基础间隔 `2s`，最少 `4` 帧，最多 `12` 帧。
+   - medium：`60s-180s`，基础间隔 `5s`，最少 `8` 帧，最多 `24` 帧。
+   - long：`180s-600s`，基础间隔 `10s`，最少 `12` 帧，最多 `36` 帧。
+   - extra_long：`> 600s`，基础间隔 `18s`，最少 `16` 帧，最多 `48` 帧。
+2. 第二阶段：根据片段整体画面信息密度调整基础间隔。
+   - 当 `static_frame_ratio >= 0.75` 或 `average_scene_change <= 4.0` 时，认为片段整体变化较少，将抽帧间隔放大到基础间隔的 `1.4` 倍。
+   - 当 `average_scene_change >= 12.0` 时，认为片段整体变化较多，将抽帧间隔缩小到基础间隔的 `0.6` 倍。
+   - 其他情况保持基础间隔不变。
+3. 第三阶段：对局部高变化区域补充关键帧。
+   - 使用低分辨率灰度帧按约 `2s` 间隔做局部采样，比较相邻采样帧的平均绝对差异。
+   - 当某个局部变化量同时高于全片段平均变化量的 `1.8` 倍且不低于 `8.0` 时，可在该局部时间点附近补充关键帧。
+   - 补帧需要遵守该分类的最大帧数限制，并与已有关键帧保持至少 `0.5s` 的间隔。
+   - 如果局部密度分析失败或采样帧不足，保留第一、第二阶段生成的关键帧，不中断整体处理。
+
+关键帧使用要求：
+
+- `keyframes` 是视频理解和问答生成的重要视觉依据，描述和问答都应优先基于这些关键帧与视频片段本身。
+- 如果关键帧显示局部突变、主体快速移动、烟雾火光出现、设备状态变化、结构件细节变化等，应在 `video_description` 和 `evidence` 中体现。
+- 如果关键帧较少或画面变化不明显，应保持保守描述，不得补充不可见信息。
 
 推荐片段元信息格式：
 
@@ -73,11 +95,25 @@
   "video_path": "outputs/02_segments/clips/video_001/video_001_seg_0001.mp4",
   "segment_id": "video_001_seg_0001",
   "time_range": [0.0, 180.0],
+  "clip_duration": 180.0,
+  "clip_length_category": "medium",
+  "clip_quality": {
+    "is_valid": true,
+    "reason": "ok",
+    "blank_frame_ratio": 0.0,
+    "static_frame_ratio": 0.18,
+    "average_scene_change": 9.6
+  },
   "keyframes": [
     {
       "frame_id": "video_001_seg_0001_frame_0001",
-      "timestamp": 30.0,
+      "timestamp": 12.0,
       "frame_path": "outputs/03_keyframes/video_001/video_001_seg_0001/000001.jpg"
+    },
+    {
+      "frame_id": "video_001_seg_0001_frame_0002",
+      "timestamp": 24.0,
+      "frame_path": "outputs/03_keyframes/video_001/video_001_seg_0001/000002.jpg"
     }
   ]
 }
@@ -104,7 +140,7 @@
 - `equipment_anomaly_detection`：设备异常检测。
 - `aircraft_structure_anomaly_detection`：飞机螺丝及结构件异常检测。
 
-路由阈值以配置 `task_relevance_threshold` 为准，当前默认值为 `0.7`。如果三类检测任务中最高分达到阈值，只选择最高分对应的一类任务，并根据该任务提示词生成问题与答案；如果三类检测任务均未达到阈值，则分别生成 `video_caption`、`video_vqa` 和 `temporal_reasoning` 三类任务的问题与答案。所有问题都要参考 `video_description` 生成，提问角度要丰富、多样、具体。未被选中的任务不要生成“不适用”问答。
+路由阈值以配置 `task_relevance_threshold` 为准，当前默认值为 `0.9`。如果三类检测任务中最高分达到阈值，只选择最高分对应的一类任务，并根据该任务提示词生成问题与答案；如果三类检测任务均未达到阈值，则分别生成 `video_caption`、`video_vqa` 和 `temporal_reasoning` 三类任务的问题与答案。所有问题都要参考 `video_description` 生成，提问角度要丰富、多样、具体。未被选中的任务不要生成“不适用”问答。
 
 最终用于 ShareGPT 的答案不要出现时间范围，不要使用“未发现异常事件”“未发现明显异常”“无明显异常”等否定异常模板。
 

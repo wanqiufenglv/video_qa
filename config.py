@@ -57,20 +57,43 @@ class LLMConfig:
 @dataclass(frozen=True)
 class VideoConfig:
     video_extensions: tuple[str, ...] = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv")
-    # 超过 short_video_threshold_seconds 的视频会按该时长进行物理截断，单位：秒；默认每 180 秒生成一个视频段。
+    # 超过 short_video_threshold_seconds 的视频会按该时长进行物理截断，单位：秒；默认每 600 秒生成一个视频段。
     default_segment_seconds: float = 600.0
     # 短视频判定阈值，单位：秒；视频总时长小于等于该值时不再切成多段，而是整体作为一个视频段。
     short_video_threshold_seconds: float = 600.0
-    # 当 frame_interval_seconds <= 0 时启用固定数量抽帧模式，每个视频段默认均匀抽取的关键帧数量。
+    # 当 frame_interval_seconds <= 0 且未命中分类抽帧配置时，启用固定数量抽帧模式。
     keyframes_per_segment: int = 5
-    # 抽帧时间间隔，单位：秒；设置为大于 0 时启用按时间间隔抽帧，例如 2.0 表示每 2 秒抽一帧。
+    # 全局兜底抽帧时间间隔，单位：秒；分类抽帧配置优先级更高。
     frame_interval_seconds: float = 10.0
-    # 按时间间隔抽帧时，每个视频段最多抽取的关键帧数量，避免长视频段产生过多帧。
+    # 全局兜底最大关键帧数量，避免长视频段产生过多帧。
     max_keyframes_per_segment: int = 48
     # 截断后视频段的长/中/短分类阈值，单位：秒；<=30 为 short，<=180 为 medium，<=600 为 long。
     clip_length_categories: tuple[tuple[str, float], ...] = (("short", 60.0), ("medium", 180.0), ("long", 600.0))
     # 截断后视频段时长超过 clip_length_categories 最大阈值时使用的分类名称。
     clip_length_overflow_category: str = "extra_long"
+    # 第一阶段：按截断后视频段长/中/短分类设置基础抽帧间隔、最少帧数和最多帧数。
+    # 格式：(clip_length_category, interval_seconds, min_frames, max_frames)
+    keyframe_sampling_profiles: tuple[tuple[str, float, int, int], ...] = (
+        ("short", 2.0, 4, 12),
+        ("medium", 5.0, 8, 24),
+        ("long", 10.0, 12, 36),
+        ("extra_long", 18.0, 16, 48),
+    )
+    # 第二阶段：根据片段整体画面变化密度微调基础抽帧间隔。
+    keyframe_low_density_scene_change_threshold: float = 4.0
+    keyframe_high_density_scene_change_threshold: float = 12.0
+    keyframe_high_static_ratio_threshold: float = 0.75
+    keyframe_low_density_interval_multiplier: float = 1.4
+    keyframe_high_density_interval_multiplier: float = 0.6
+    # 第三阶段：对局部高变化区域补充关键帧，避免固定间隔漏掉短时事件。
+    enable_local_density_keyframe_boost: bool = True
+    keyframe_density_sample_interval_seconds: float = 2.0
+    keyframe_density_max_sample_frames: int = 120
+    keyframe_density_frame_width: int = 64
+    keyframe_density_frame_height: int = 64
+    keyframe_local_change_multiplier: float = 1.8
+    keyframe_local_min_scene_change: float = 8.0
+    keyframe_min_gap_seconds: float = 0.5
     # 截断视频质量检测的采样时间间隔，单位：秒；用于抽样判断空白画面和静态画面比例。
     clip_quality_sample_interval_seconds: float = 2.0
     clip_quality_max_sample_frames: int = 12
