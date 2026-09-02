@@ -134,27 +134,43 @@
 
 ### 4. 视频描述与任务路由
 
-每个视频片段必须先生成一段尽量完整的 `video_description`。随后只基于该描述对三类专业检测任务打 0 到 1 的相关度分数：
+任务模式由 `config.py` 中的 `PipelineConfig.enable_anomaly_detection_tasks` 控制，默认值为 `False`。
+
+- `False`（默认）：只执行 `video_caption`、`video_vqa` 和 `temporal_reasoning`，不要生成 `task_relevance`，也不要生成任何异常检测任务字段。
+- `True`：启用三类专业检测任务的评分与路由。
+
+任务模式会写入 `task_mode` 和 `task_run_id`，用于区分两种模式的断点。切换开关后可以复用切片和关键帧，但必须按新模式重新执行模型任务。
+
+开关关闭时只写入三个基础任务对应的中间文件和 ShareGPT 文件。程序不会删除同一输出目录内由旧模式产生的异常检测文件。
+
+每个视频片段始终必须先生成一段尽量完整的 `video_description`。仅当开关为 `True` 时，才基于该描述对三类专业检测任务打 0 到 1 的相关度分数：
 
 - `abnormal_event_detection`：重点事件与可见现象识别。
 - `equipment_anomaly_detection`：设备异常检测。
 - `aircraft_structure_anomaly_detection`：飞机螺丝及结构件异常检测。
 
-路由阈值以配置 `task_relevance_threshold` 为准，当前默认值为 `0.9`。如果三类检测任务中最高分达到阈值，只选择最高分对应的一类任务，并根据该任务提示词生成问题与答案；如果三类检测任务均未达到阈值，则分别生成 `video_caption`、`video_vqa` 和 `temporal_reasoning` 三类任务的问题与答案。所有问题都要参考 `video_description` 生成，提问角度要丰富、多样、具体。未被选中的任务不要生成“不适用”问答。
+开关开启时，路由阈值以配置 `task_relevance_threshold` 为准，当前默认值为 `0.9`。如果三类检测任务中最高分达到阈值，只选择最高分对应的一类任务，并根据该任务提示词生成问题与答案；如果三类检测任务均未达到阈值，则分别生成三个基础任务。开关关闭时不进行检测评分，`selected_task_types` 必须固定为 `["video_caption", "video_vqa", "temporal_reasoning"]`。所有问题都要参考 `video_description` 生成，提问角度要丰富、多样、具体。未被选中的任务不要生成“不适用”问答。
 
 最终用于 ShareGPT 的答案不要出现时间范围，不要使用“未发现异常事件”“未发现明显异常”“无明显异常”等否定异常模板。
 
-推荐路由字段：
+默认关闭状态下的推荐路由字段：
 
 ```json
 {
   "video_description": "先生成的完整视频描述",
+  "selected_task_types": ["video_caption", "video_vqa", "temporal_reasoning"]
+}
+```
+
+开关开启后才添加 `task_relevance`：
+
+```json
+{
   "task_relevance": {
     "abnormal_event_detection": 0.12,
     "equipment_anomaly_detection": 0.08,
     "aircraft_structure_anomaly_detection": 0.03
-  },
-  "selected_task_types": ["video_caption", "video_vqa", "temporal_reasoning"]
+  }
 }
 ```
 
@@ -468,9 +484,9 @@ outputs/
 
 你需要完成以下任务：
 1. 先生成尽量丰富的 video_description。
-2. 只基于 video_description 给 abnormal_event_detection、equipment_anomaly_detection、aircraft_structure_anomaly_detection 三类任务分别打 0 到 1 的相关度分数。
-3. 如果最高检测分达到配置阈值，只选择最高分对应的一类检测任务，并根据该任务提示词生成问题与答案。
-4. 如果三类检测分均低于配置阈值，只生成 video_caption、video_vqa 和 temporal_reasoning 三类任务的问题与答案。
+2. 读取 enable_anomaly_detection_tasks：若为 false，只生成 video_caption、video_vqa 和 temporal_reasoning，不进行检测评分；若为 true，才对 abnormal_event_detection、equipment_anomaly_detection、aircraft_structure_anomaly_detection 分别打 0 到 1 的相关度分数。
+3. 仅在开关开启时：如果最高检测分达到配置阈值，只选择最高分对应的一类检测任务，并根据该任务提示词生成问题与答案。
+4. 开关关闭或开关开启但三类检测分均低于阈值时，只生成 video_caption、video_vqa 和 temporal_reasoning 三类任务的问题与答案。
 5. 将选中任务转换为 ShareGPT 格式；最终 ShareGPT 样本只包含 conversations 和 videos，不包含 metadata 或其他元数据字段。
 6. 中间任务数据必须包含 video_id、segment_id、time_range、keyframes、evidence、confidence，保证可溯源。
 
@@ -541,4 +557,3 @@ outputs/
 - `aircraft_structure_anomaly_detection`：飞机螺丝及结构件异常检测。
 
 如果视频内容不涉及三类专业检测任务，不得编造异常或生成“不适用”检测问答，应改为生成 `video_caption`、`video_vqa` 与 `temporal_reasoning`。所有 ShareGPT 样本必须包含 `<video>` 和 `videos`，且不要包含 `metadata` 或其他元数据字段。
-

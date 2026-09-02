@@ -1,0 +1,2 @@
+# 该项目当前仅使用 Python 标准库，无需额外 pip 包。
+# 系统依赖：ffmpeg、ffprobe（请单独安装并加入 PATH）。

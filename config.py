@@ -57,27 +57,27 @@ class LLMConfig:
 @dataclass(frozen=True)
 class VideoConfig:
     video_extensions: tuple[str, ...] = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv")
-    # 超过 short_video_threshold_seconds 的视频会按该时长进行物理截断，单位：秒；默认每 600 秒生成一个视频段。
-    default_segment_seconds: float = 600.0
+    # 超过 short_video_threshold_seconds 的视频会按该时长进行物理截断，单位：秒；默认每 300 秒生成一个视频段。
+    default_segment_seconds: float = 300.0
     # 短视频判定阈值，单位：秒；视频总时长小于等于该值时不再切成多段，而是整体作为一个视频段。
-    short_video_threshold_seconds: float = 600.0
+    short_video_threshold_seconds: float = 30.0
     # 当 frame_interval_seconds <= 0 且未命中分类抽帧配置时，启用固定数量抽帧模式。
-    keyframes_per_segment: int = 5
+    keyframes_per_segment: int = 3
     # 全局兜底抽帧时间间隔，单位：秒；分类抽帧配置优先级更高。
     frame_interval_seconds: float = 10.0
     # 全局兜底最大关键帧数量，避免长视频段产生过多帧。
-    max_keyframes_per_segment: int = 48
+    max_keyframes_per_segment: int = 24
     # 截断后视频段的长/中/短分类阈值，单位：秒；<=30 为 short，<=180 为 medium，<=600 为 long。
-    clip_length_categories: tuple[tuple[str, float], ...] = (("short", 60.0), ("medium", 180.0), ("long", 600.0))
+    clip_length_categories: tuple[tuple[str, float], ...] = (("short", 60.0), ("medium", 180.0), ("long", 300.0))
     # 截断后视频段时长超过 clip_length_categories 最大阈值时使用的分类名称。
     clip_length_overflow_category: str = "extra_long"
     # 第一阶段：按截断后视频段长/中/短分类设置基础抽帧间隔、最少帧数和最多帧数。
     # 格式：(clip_length_category, interval_seconds, min_frames, max_frames)
     keyframe_sampling_profiles: tuple[tuple[str, float, int, int], ...] = (
-        ("short", 2.0, 4, 12),
-        ("medium", 5.0, 8, 24),
-        ("long", 10.0, 12, 36),
-        ("extra_long", 18.0, 16, 48),
+        ("short", 2.0, 4, 8),
+        ("medium", 5.0, 8, 16),
+        ("long", 10.0, 12, 32),
+        ("extra_long", 18.0, 12, 36),
     )
     # 第二阶段：根据片段整体画面变化密度微调基础抽帧间隔。
     keyframe_low_density_scene_change_threshold: float = 4.0
@@ -158,6 +158,7 @@ class OutputConfig:
     process_log_file: str = "logs/process_log.jsonl"
     runtime_log_file: str = "logs/process.log"
     progress_file: str = "progress/progress.json"
+    checkpoints_file: str = "progress/checkpoints.jsonl"
 
     @property
     def sharegpt_task_files(self) -> dict[str, str]:
@@ -300,7 +301,17 @@ class CliConfig:
 @dataclass(frozen=True)
 class PipelineConfig:
     completed_segment_key: str = "segment_id"
+    checkpoint_payload_key: str = "payload"
+    checkpoint_status_key: str = "status"
+    checkpoint_status_completed: str = "completed"
+    checkpoint_version: int = 1
     sample_id_key: str = "sample_id"
+    # 是否启用异常事件、设备异常、飞机螺丝及结构件异常检测任务；默认关闭。
+    enable_anomaly_detection_tasks: bool = False
+    task_mode_key: str = "task_mode"
+    task_run_id_key: str = "task_run_id"
+    basic_task_mode: str = "basic_only"
+    anomaly_task_mode: str = "anomaly_detection_enabled"
     minimum_quality_score: float = 0.7
     task_relevance_threshold: float = 0.9
     default_confidence: float = 0.0

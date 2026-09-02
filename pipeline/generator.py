@@ -14,7 +14,12 @@ from video_qa.converters.format_converter import FormatConverter
 from video_qa.io_utils.error_logger import ErrorLogger
 from video_qa.io_utils.logging_config import setup_logging
 from video_qa.io_utils.progress_writer import ProgressWriter
-from video_qa.io_utils.resume_manager import ResumeManager
+from video_qa.io_utils.resume_manager import (
+    CheckpointManager,
+    ResumeManager,
+    current_task_mode,
+    task_run_id,
+)
 from video_qa.io_utils.stream_writer import JsonlStreamWriter
 from video_qa.models.schemas import KeyFrame, VideoSegment
 from video_qa.pipeline.video_worker import process_video_task
@@ -40,6 +45,7 @@ class VideoQAGenerator:
         self.process_log_writer = self._writer(CONFIG.output.process_log_file)
         self.progress_writer = ProgressWriter(self.output_dir / CONFIG.output.progress_file)
         self.error_logger = ErrorLogger(self._writer(CONFIG.output.errors_file), self.logger)
+        self.checkpoint_manager = CheckpointManager(self.output_dir / CONFIG.output.checkpoints_file)
         self.dependency_checker = VideoDependencyChecker()
         self._progress_lock = Lock()
         self._progress = self._empty_progress()
@@ -68,7 +74,12 @@ class VideoQAGenerator:
         self._log_event(CONFIG.pipeline.stage_dependency_check, CONFIG.pipeline.event_finished)
         completed_segments = ResumeManager(
             self.output_dir / CONFIG.output.raw_results_file,
-            CONFIG.pipeline.completed_segment_key,
+            CONFIG.pipeline.task_run_id_key,
+        ).load_completed_ids()
+        checkpoint_states = self.checkpoint_manager.load_states()
+        existing_metadata_ids = ResumeManager(
+            self.output_dir / CONFIG.output.metadata_file,
+            CONFIG.fields.video_id,
         ).load_completed_ids()
         self._log_event(CONFIG.pipeline.stage_scan, CONFIG.pipeline.event_started)
         videos = self.scanner.scan()
@@ -84,10 +95,12 @@ class VideoQAGenerator:
                 video_id=metadata.video_id,
                 video_path=metadata.video_path,
             )
-            self._writer(CONFIG.output.metadata_file).append(metadata.to_dict())
+            if metadata.video_id not in existing_metadata_ids:
+                self._writer(CONFIG.output.metadata_file).append(metadata.to_dict(), durable=True)
+                existing_metadata_ids.add(metadata.video_id)
             pending_segments: list[VideoSegment] = []
             for segment in self.segmenter.build_segments(metadata):
-                if segment.segment_id in completed_segments:
+                if task_run_id(segment.segment_id) in completed_segments:
                     skipped_count += 1
                     self._log_event(
                         CONFIG.pipeline.stage_segment,
@@ -104,6 +117,10 @@ class VideoQAGenerator:
                         "video_path": metadata.video_path,
                         "output_dir": str(self.output_dir),
                         "segments": [segment.to_dict() for segment in pending_segments],
+                        "checkpoint_states": {
+                            segment.segment_id: checkpoint_states.get(segment.segment_id, {})
+                            for segment in pending_segments
+                        },
                     }
                 )
 
@@ -121,7 +138,7 @@ class VideoQAGenerator:
             max_workers=self.max_workers,
         )
         self._run_video_tasks(video_tasks)
-        self._rebuild_missing_sharegpt_records()
+        self._rebuild_missing_output_records()
         self._set_progress_finished()
         self._log_event(CONFIG.pipeline.stage_start, CONFIG.pipeline.event_finished)
 
@@ -151,13 +168,13 @@ class VideoQAGenerator:
                     )
                 self._mark_video_done(result)
 
-    def _rebuild_missing_sharegpt_records(self) -> None:
+    def _rebuild_missing_output_records(self) -> None:
         raw_path = self.output_dir / CONFIG.output.raw_results_file
         if not raw_path.exists():
             return
 
-        existing_segment_ids_by_task = self._load_sharegpt_segment_ids_by_task()
-        existing_signatures_by_task = self._load_sharegpt_signatures_by_task()
+        existing_signatures = self._load_output_signatures()
+        checkpoint_states = self.checkpoint_manager.load_states()
         metadata_by_video_id = self._load_metadata_video_paths()
         segments_by_id = self._load_segments_by_id(metadata_by_video_id)
         converter = FormatConverter()
@@ -165,82 +182,122 @@ class VideoQAGenerator:
         rebuilt_records = 0
         rebuilt_segments: set[str] = set()
 
+        latest_raw_results: dict[str, dict[str, Any]] = {}
         for raw_result in self._iter_jsonl(raw_path):
             segment_id = self._raw_segment_id(raw_result)
-            if not segment_id:
-                continue
+            if segment_id and self._raw_matches_current_task_mode(raw_result):
+                latest_raw_results[segment_id] = raw_result
 
+        for segment_id, raw_result in latest_raw_results.items():
             segment = self._segment_from_raw_result(raw_result, metadata_by_video_id, segments_by_id)
             if segment is None:
                 self.error_logger.log(
                     stage=CONFIG.pipeline.stage_write_outputs,
-                    message="Cannot rebuild ShareGPT record because raw result lacks trace fields.",
+                    message="Cannot rebuild task records because raw result lacks trace fields.",
                     context=raw_result,
                 )
                 continue
 
-            records_by_task = converter.sharegpt_records_by_task(raw_result, segment)
-            for task_type, records in records_by_task.items():
-                if segment_id in existing_segment_ids_by_task.get(task_type, set()):
-                    continue
-                writer = self._writer(CONFIG.output.sharegpt_task_files[task_type])
-                task_records = 0
+            segment_rebuilt = False
+            for file_name, records in self._converted_records_by_file(converter, raw_result, segment).items():
+                writer = self._writer(file_name)
                 for record in records:
-                    signature = self._sharegpt_signature(record)
-                    if signature and signature in existing_signatures_by_task.get(task_type, set()):
+                    if not checker.is_valid(record):
                         continue
-                    if checker.is_valid(record):
-                        writer.append(record)
-                        if signature:
-                            existing_signatures_by_task.setdefault(task_type, set()).add(signature)
-                        rebuilt_records += 1
-                        task_records += 1
-                if task_records:
-                    existing_segment_ids_by_task.setdefault(task_type, set()).add(segment_id)
-                    rebuilt_segments.add(segment_id)
+                    signature = self._record_signature(record)
+                    if signature in existing_signatures.setdefault(file_name, set()):
+                        continue
+                    writer.append(record, durable=True)
+                    existing_signatures[file_name].add(signature)
+                    rebuilt_records += 1
+                    segment_rebuilt = True
+            if segment_rebuilt:
+                rebuilt_segments.add(segment_id)
+
+            if CONFIG.pipeline.stage_write_outputs not in checkpoint_states.get(segment_id, {}):
+                self.checkpoint_manager.save(
+                    segment_id,
+                    CONFIG.pipeline.stage_write_outputs,
+                    {"segment": segment.to_dict(), "reconciled_from_raw": True},
+                )
+                checkpoint_states.setdefault(segment_id, {})[CONFIG.pipeline.stage_write_outputs] = {}
+            if CONFIG.pipeline.stage_segment not in checkpoint_states.get(segment_id, {}):
+                self.checkpoint_manager.save(
+                    segment_id,
+                    CONFIG.pipeline.stage_segment,
+                    {"segment": segment.to_dict(), "reconciled_from_raw": True},
+                )
+                checkpoint_states.setdefault(segment_id, {})[CONFIG.pipeline.stage_segment] = {}
 
         if rebuilt_segments:
             self._log_event(
                 CONFIG.pipeline.stage_write_outputs,
                 CONFIG.pipeline.event_finished,
                 rebuilt_segments=len(rebuilt_segments),
-                rebuilt_sharegpt_records=rebuilt_records,
+                rebuilt_records=rebuilt_records,
             )
 
-    def _load_sharegpt_segment_ids_by_task(self) -> dict[str, set[str]]:
-        segment_ids_by_task: dict[str, set[str]] = {}
-        for task_type, file_name in CONFIG.output.sharegpt_task_files.items():
-            segment_ids: set[str] = set()
-            sharegpt_path = self.output_dir / file_name
-            for item in self._iter_jsonl(sharegpt_path):
-                segment_id = item.get(CONFIG.fields.segment_id)
-                metadata = item.get(CONFIG.fields.metadata)
-                if not segment_id and isinstance(metadata, dict):
-                    segment_id = metadata.get(CONFIG.fields.segment_id)
-                if segment_id:
-                    segment_ids.add(str(segment_id))
-            segment_ids_by_task[task_type] = segment_ids
-        return segment_ids_by_task
+    def _converted_records_by_file(
+        self,
+        converter: FormatConverter,
+        raw_result: dict[str, Any],
+        segment: VideoSegment,
+    ) -> dict[str, list[dict[str, Any]]]:
+        records: dict[str, list[dict[str, Any]]] = {
+            CONFIG.output.captions_file: [],
+            CONFIG.output.vqa_file: converter.vqa_records(raw_result, segment),
+            CONFIG.output.temporal_reasoning_file: converter.temporal_reasoning_records(raw_result, segment),
+            CONFIG.output.abnormal_events_file: [],
+            CONFIG.output.equipment_anomalies_file: [],
+            CONFIG.output.aircraft_structure_anomalies_file: [],
+        }
+        caption = converter.caption_record(raw_result, segment)
+        if caption:
+            records[CONFIG.output.captions_file].append(caption)
+        task_files = {
+            CONFIG.tasks.abnormal_event_detection: CONFIG.output.abnormal_events_file,
+            CONFIG.tasks.equipment_anomaly_detection: CONFIG.output.equipment_anomalies_file,
+            CONFIG.tasks.aircraft_structure_anomaly_detection: CONFIG.output.aircraft_structure_anomalies_file,
+        }
+        for task_type, file_name in task_files.items():
+            record = converter.task_record(raw_result, segment, task_type)
+            if record:
+                records[file_name].append(record)
+        for task_type, task_records in converter.sharegpt_records_by_task(raw_result, segment).items():
+            records[CONFIG.output.sharegpt_task_files[task_type]] = task_records
+        return records
 
-    def _load_sharegpt_signatures_by_task(self) -> dict[str, set[str]]:
-        signatures_by_task: dict[str, set[str]] = {}
-        for task_type, file_name in CONFIG.output.sharegpt_task_files.items():
-            signatures: set[str] = set()
-            sharegpt_path = self.output_dir / file_name
-            for item in self._iter_jsonl(sharegpt_path):
-                signature = self._sharegpt_signature(item)
-                if signature:
-                    signatures.add(signature)
-            signatures_by_task[task_type] = signatures
-        return signatures_by_task
+    def _output_file_names(self) -> set[str]:
+        return {
+            CONFIG.output.captions_file,
+            CONFIG.output.vqa_file,
+            CONFIG.output.temporal_reasoning_file,
+            CONFIG.output.abnormal_events_file,
+            CONFIG.output.equipment_anomalies_file,
+            CONFIG.output.aircraft_structure_anomalies_file,
+            *CONFIG.output.sharegpt_task_files.values(),
+        }
 
-    def _sharegpt_signature(self, item: dict[str, Any]) -> str:
+    def _load_output_signatures(self) -> dict[str, set[str]]:
+        return {
+            file_name: {self._record_signature(item) for item in self._iter_jsonl(self.output_dir / file_name)}
+            for file_name in self._output_file_names()
+        }
+
+    def _record_signature(self, item: dict[str, Any]) -> str:
+        sample_id = item.get(CONFIG.pipeline.sample_id_key)
+        if sample_id:
+            return f"sample_id:{sample_id}"
         conversations = item.get("conversations")
         videos = item.get(CONFIG.fields.videos)
-        if not isinstance(conversations, list) or not isinstance(videos, list):
-            return ""
+        if isinstance(conversations, list) and isinstance(videos, list):
+            return json.dumps(
+                {"conversations": conversations, CONFIG.fields.videos: videos},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         return json.dumps(
-            {"conversations": conversations, CONFIG.fields.videos: videos},
+            item,
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -306,6 +363,13 @@ class VideoQAGenerator:
 
     def _raw_segment_id(self, raw_result: dict[str, Any]) -> str:
         return str(raw_result.get(CONFIG.pipeline.completed_segment_key) or raw_result.get(CONFIG.fields.segment_id) or "")
+
+    def _raw_matches_current_task_mode(self, raw_result: dict[str, Any]) -> bool:
+        raw_mode = raw_result.get(CONFIG.pipeline.task_mode_key)
+        if raw_mode:
+            return str(raw_mode) == current_task_mode()
+        # 旧版结果没有任务模式字段，当作原先默认开启异常检测的模式。
+        return CONFIG.pipeline.enable_anomaly_detection_tasks
 
     def _segment_from_raw_result(
         self,

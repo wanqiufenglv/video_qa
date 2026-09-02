@@ -158,6 +158,8 @@ class FormatConverter:
         return [CONFIG.tasks.video_caption, CONFIG.tasks.video_vqa, CONFIG.tasks.temporal_reasoning]
 
     def _selected_detection_task(self, raw_result: dict[str, Any]) -> str:
+        if not CONFIG.pipeline.enable_anomaly_detection_tasks:
+            return ""
         detection_tasks = self._detection_task_types()
         scores = self._task_relevance_scores(raw_result)
         if scores:
